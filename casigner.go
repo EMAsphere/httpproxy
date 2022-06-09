@@ -105,6 +105,7 @@ func SignHosts(ca tls.Certificate, hosts []string) (*tls.Certificate, error) {
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
+		SignatureAlgorithm:    x509.SHA384WithRSA,
 	}
 	for _, h := range hosts {
 		h = stripPort(h)
@@ -115,7 +116,7 @@ func SignHosts(ca tls.Certificate, hosts []string) (*tls.Certificate, error) {
 		}
 	}
 	rnd := mrand.New(mrand.NewSource(serial.Int64()))
-	certPriv, err := rsa.GenerateKey(rnd, 1024)
+	certPriv, err := rsa.GenerateKey(rnd, 4096)
 	if err != nil {
 		return nil, err
 	}
