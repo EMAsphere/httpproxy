@@ -295,7 +295,7 @@ func (ctx *Context) doConnect(w http.ResponseWriter, r *http.Request) (b bool) {
 		if err := ctx.hijTLSConn.Handshake(); err != nil {
 			ctx.hijTLSConn.Close()
 			if !isConnectionClosed(err) {
-				ctx.doError("Connect", ErrTLSHandshake, err)
+				ctx.doError("Connect '"+host+"'", ErrTLSHandshake, err)
 			}
 			return
 		}
