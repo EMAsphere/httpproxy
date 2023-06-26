@@ -105,7 +105,7 @@ func SignHosts(ca tls.Certificate, hosts []string) (*tls.Certificate, error) {
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
-		SignatureAlgorithm:    x509.SHA384WithRSA,
+		SignatureAlgorithm:    x509.ECDSAWithSHA256,
 	}
 	for _, h := range hosts {
 		h = stripPort(h)
