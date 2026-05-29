@@ -210,7 +210,7 @@ func (ctx *Context) doConnect(w http.ResponseWriter, r *http.Request) (b bool) {
 	case ConnectProxy:
 		conn, err := net.Dial("tcp", host)
 		if err != nil {
-			hijConn.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
+			hijConn.Write([]byte("HTTP/1.1 503 Service Unavailable\r\n\r\n"))
 			hijConn.Close()
 			ctx.doError("Connect", ErrRemoteConnect, err)
 			return
