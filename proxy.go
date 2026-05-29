@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"net/http"
 	"sync/atomic"
+	"time"
 )
 
 // Proxy defines parameters for running an HTTP Proxy. It implements
@@ -56,6 +57,10 @@ type Proxy struct {
 	// By default, "".
 	AuthType string
 
+	// Timeout for TCP dial attempts during CONNECT tunneling.
+	// By default, 30 seconds.
+	DialTimeout time.Duration
+
 	signer *CaSigner
 }
 
@@ -70,6 +75,7 @@ func NewProxyCert(caCert, caKey []byte) (*Proxy, error) {
 		Rt: &http.Transport{TLSClientConfig: &tls.Config{},
 			Proxy: http.ProxyFromEnvironment},
 		MitmChunked: true,
+		DialTimeout: 30 * time.Second,
 		signer:      NewCaSignerCache(1024),
 	}
 	prx.signer.Ca = &prx.Ca
@@ -85,6 +91,13 @@ func NewProxyCert(caCert, caKey []byte) (*Proxy, error) {
 		return nil, err
 	}
 	return prx, nil
+}
+
+func (prx *Proxy) dialTimeout() time.Duration {
+	if prx.DialTimeout > 0 {
+		return prx.DialTimeout
+	}
+	return 30 * time.Second
 }
 
 // ServeHTTP implements http.Handler.

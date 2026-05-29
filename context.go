@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Context keeps context of each proxy request.
@@ -39,6 +40,10 @@ type Context struct {
 	// Remote host, if proxy request method is CONNECT.
 	// It's using internally. Don't change in Context struct!
 	ConnectHost string
+
+	ConnectDialDuration time.Duration
+	ConnectDialError    string
+	ConnectDialAddr     string
 
 	// User data to use free.
 	UserData interface{}
@@ -208,8 +213,13 @@ func (ctx *Context) doConnect(w http.ResponseWriter, r *http.Request) (b bool) {
 	ctx.ConnectHost = host
 	switch ctx.ConnectAction {
 	case ConnectProxy:
-		conn, err := net.Dial("tcp", host)
+		dialer := net.Dialer{Timeout: ctx.Prx.dialTimeout()}
+		start := time.Now()
+		conn, err := dialer.DialContext(r.Context(), "tcp", host)
+		ctx.ConnectDialDuration = time.Since(start)
 		if err != nil {
+			ctx.ConnectDialError = ClassifyDialError(err)
+			ctx.ConnectDialAddr = ExtractDialAddr(err)
 			hijConn.Write([]byte("HTTP/1.1 503 Service Unavailable\r\n\r\n"))
 			hijConn.Close()
 			ctx.doError("Connect", ErrRemoteConnect, err)

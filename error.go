@@ -1,6 +1,8 @@
 package httpproxy
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -56,4 +58,43 @@ func isConnectionClosed(err error) bool {
 		}
 	}
 	return false
+}
+
+func ClassifyDialError(err error) string {
+	if err == nil {
+		return ""
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return "dns_error"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "tcp_timeout"
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch errno {
+		case syscall.ECONNREFUSED:
+			return "connection_refused"
+		case syscall.ENETUNREACH:
+			return "network_unreachable"
+		case syscall.EHOSTUNREACH:
+			return "host_unreachable"
+		default:
+			return fmt.Sprintf("syscall_%s", errno.Error())
+		}
+	}
+	return err.Error()
+}
+
+func ExtractDialAddr(err error) string {
+	if err == nil {
+		return ""
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Addr != nil {
+		return opErr.Addr.String()
+	}
+	return ""
 }
