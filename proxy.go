@@ -1,7 +1,9 @@
 package httpproxy
 
 import (
+	"context"
 	"crypto/tls"
+	"net"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -9,7 +11,8 @@ import (
 
 // Proxy defines parameters for running an HTTP Proxy. It implements
 // http.Handler interface for ListenAndServe function. If you need, you must
-// set Proxy struct before handling requests.
+// set Proxy struct before handling requests. A Proxy must not be copied after
+// first use: a copy would not share the open tunnels.
 type Proxy struct {
 	// Session number of last proxy request.
 	SessionNo int64
@@ -63,6 +66,11 @@ type Proxy struct {
 
 	signer *CaSigner
 
+	// dial opens the remote connection of a pass-through tunnel, a
+	// *net.TCPConn. Nil means a net.Dialer with DialTimeout. Tests replace
+	// it.
+	dial func(ctx context.Context, network, address string) (net.Conn, error)
+
 	// Open tunnels and draining mode, see tunnels.go.
 	tunnels  tunnelRegistry
 	draining atomic.Bool
@@ -95,6 +103,15 @@ func NewProxyCert(caCert, caKey []byte) (*Proxy, error) {
 		return nil, err
 	}
 	return prx, nil
+}
+
+// dialRemote opens the remote connection of a pass-through tunnel.
+func (prx *Proxy) dialRemote(ctx context.Context, host string) (net.Conn, error) {
+	if prx.dial != nil {
+		return prx.dial(ctx, "tcp", host)
+	}
+	dialer := net.Dialer{Timeout: prx.dialTimeout()}
+	return dialer.DialContext(ctx, "tcp", host)
 }
 
 func (prx *Proxy) dialTimeout() time.Duration {

@@ -3,6 +3,7 @@ package httpproxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -10,6 +11,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -80,22 +82,26 @@ func testCA(t *testing.T) (certPEM, keyPEM []byte) {
 // startProxy starts a proxy that handles every CONNECT with action.
 func startProxy(t *testing.T, action ConnectAction) (*Proxy, string, *errRecorder) {
 	t.Helper()
-	return startProxyOnConnect(t, func(ctx *Context, host string) (ConnectAction, string) {
-		return action, host
+	return startProxyWith(t, func(prx *Proxy) {
+		prx.OnConnect = func(ctx *Context, host string) (ConnectAction, string) {
+			return action, host
+		}
 	})
 }
 
-func startProxyOnConnect(t *testing.T, onConnect func(ctx *Context, host string) (ConnectAction, string)) (*Proxy, string, *errRecorder) {
+// startProxyWith starts a proxy configured by setup, which runs before the
+// proxy serves anything.
+func startProxyWith(t *testing.T, setup func(prx *Proxy)) (*Proxy, string, *errRecorder) {
 	t.Helper()
 	prx, err := NewProxyCert(testCA(t))
 	if err != nil {
 		t.Fatal(err)
 	}
-	prx.OnConnect = onConnect
 	// MITM tests talk to httptest TLS servers.
 	prx.Rt = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	rec := &errRecorder{}
 	prx.OnError = rec.record
+	setup(prx)
 	srv := httptest.NewServer(prx)
 	t.Cleanup(srv.Close)
 	return prx, srv.Listener.Addr().String(), rec
@@ -139,40 +145,6 @@ func dialTunnel(t *testing.T, proxyAddr, target string) net.Conn {
 		t.Fatalf("CONNECT %s: got %q, %v", target, got, err)
 	}
 	return c
-}
-
-// pingPong answers "pong\n" to each line, after delay.
-func pingPong(delay time.Duration) func(net.Conn) {
-	return func(c net.Conn) {
-		br := bufio.NewReader(c)
-		for {
-			if _, err := br.ReadString('\n'); err != nil {
-				return
-			}
-			time.Sleep(delay)
-			if _, err := io.WriteString(c, "pong\n"); err != nil {
-				return
-			}
-		}
-	}
-}
-
-func ping(t *testing.T, c net.Conn) {
-	t.Helper()
-	if _, err := io.WriteString(c, "ping\n"); err != nil {
-		t.Fatal(err)
-	}
-	expectPong(t, c)
-}
-
-func expectPong(t *testing.T, c net.Conn) {
-	t.Helper()
-	c.SetReadDeadline(time.Now().Add(5 * time.Second))
-	defer c.SetReadDeadline(time.Time{})
-	buf := make([]byte, 5)
-	if _, err := io.ReadFull(c, buf); err != nil || string(buf) != "pong\n" {
-		t.Fatalf("got %q, %v", buf, err)
-	}
 }
 
 // expectEOF checks that the tunnel was closed cleanly.
@@ -323,10 +295,12 @@ func TestCloseAllTunnels(t *testing.T) {
 func TestTunnelTrackedWhileOnConnectBlocks(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	prx, addr, rec := startProxyOnConnect(t, func(ctx *Context, host string) (ConnectAction, string) {
-		close(entered)
-		<-release
-		return ConnectProxy, host
+	prx, addr, rec := startProxyWith(t, func(prx *Proxy) {
+		prx.OnConnect = func(ctx *Context, host string) (ConnectAction, string) {
+			close(entered)
+			<-release
+			return ConnectProxy, host
+		}
 	})
 	var unblock sync.Once
 	t.Cleanup(func() { unblock.Do(func() { close(release) }) })
@@ -368,10 +342,13 @@ func TestTunnelTrackedWhileOnConnectBlocks(t *testing.T) {
 // must then be refused, so that the caller closes it.
 func TestTunnelClosedBeforeHijack(t *testing.T) {
 	prx := &Proxy{}
-	tun := prx.trackTunnel("example.com:443")
+	tun := prx.trackTunnel(context.Background(), "example.com:443")
 	closed := prx.CloseAllTunnels()
 	if len(closed) != 1 || closed[0].Host != "example.com:443" || closed[0].Action != ConnectNone {
 		t.Fatalf("closed %+v, want the pending tunnel", closed)
+	}
+	if tun.ctx.Err() == nil {
+		t.Fatal("closing the tunnel did not cancel its context")
 	}
 	client, server := net.Pipe()
 	defer client.Close()
@@ -386,6 +363,112 @@ func TestTunnelClosedBeforeHijack(t *testing.T) {
 	if n := prx.ActiveTunnels(); n != 0 {
 		t.Fatalf("%d tracked tunnels, want 0", n)
 	}
+}
+
+// CloseAllTunnels must abort the dial of a pass-through tunnel instead of
+// leaving the tunnel tracked until the dial times out, and the aborted dial
+// must not be reported as an error.
+func TestCloseAllTunnelsAbortsDial(t *testing.T) {
+	dialing := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	prx, addr, rec := startProxyWith(t, func(prx *Proxy) {
+		prx.OnConnect = func(ctx *Context, host string) (ConnectAction, string) {
+			return ConnectProxy, host
+		}
+		// A remote host that never answers.
+		prx.dial = func(ctx context.Context, network, address string) (net.Conn, error) {
+			close(dialing)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-release:
+				return nil, errors.New("dial not aborted")
+			}
+		}
+	})
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	fmt.Fprintf(c, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+	select {
+	case <-dialing:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the proxy did not dial")
+	}
+
+	if closed := prx.CloseAllTunnels(); len(closed) != 1 {
+		t.Fatalf("closed %d tunnels, want 1", len(closed))
+	}
+	expectEOF(t, c)
+	waitFor(t, "the tunnel to be untracked", func() bool { return prx.ActiveTunnels() == 0 })
+	rec.expectNone(t)
+}
+
+// CloseAllTunnels must abort the upstream call of a MITM request in progress
+// instead of leaving the session tracked until the upstream answers.
+func TestCloseAllTunnelsAbortsMitmUpstreamCall(t *testing.T) {
+	prx, addr, rec := startProxy(t, ConnectMitm)
+	entered := make(chan struct{})
+	aborted := make(chan struct{})
+	release := make(chan struct{})
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		select {
+		case <-r.Context().Done():
+			close(aborted)
+		case <-release:
+		}
+	}))
+	t.Cleanup(upstream.Close)
+	t.Cleanup(func() { close(release) })
+	target := upstream.Listener.Addr().String()
+	tc, _ := mitmSession(t, addr, target)
+
+	sendMitmGet(t, tc, target)
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request did not reach the upstream")
+	}
+	if closed := prx.CloseAllTunnels(); len(closed) != 1 {
+		t.Fatalf("closed %d tunnels, want 1", len(closed))
+	}
+	select {
+	case <-aborted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the upstream call kept running after CloseAllTunnels")
+	}
+	waitFor(t, "the MITM session to be untracked", func() bool { return prx.ActiveTunnels() == 0 })
+	rec.expectNone(t)
+}
+
+// A response produced by OnRequest (a rate limit, say) must also end the MITM
+// session while draining.
+func TestMitmDrainingEndsSessionAfterOnRequestResponse(t *testing.T) {
+	prx, addr, rec := startProxyWith(t, func(prx *Proxy) {
+		prx.OnConnect = func(ctx *Context, host string) (ConnectAction, string) {
+			return ConnectMitm, host
+		}
+		prx.OnRequest = func(ctx *Context, req *http.Request) *http.Response {
+			return InMemoryResponse(http.StatusTooManyRequests, nil, []byte("ok"))
+		}
+	})
+	target := startOKServer(t, 0).Listener.Addr().String()
+	tc, br := mitmSession(t, addr, target)
+
+	if resp := mitmGet(t, tc, br, target); resp.Close || resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("before draining, want a kept-alive 429, got %d (close=%v)", resp.StatusCode, resp.Close)
+	}
+	prx.SetDraining(true)
+	if resp := mitmGet(t, tc, br, target); !resp.Close {
+		t.Fatal(`while draining, the response should carry "Connection: close"`)
+	}
+	expectSessionEnd(t, br)
+	waitFor(t, "the MITM session to be untracked", func() bool { return prx.ActiveTunnels() == 0 })
+	rec.expectNone(t)
 }
 
 func TestMitmDrainingEndsSessionAfterResponse(t *testing.T) {

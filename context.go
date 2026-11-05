@@ -51,8 +51,9 @@ type Context struct {
 	hijTLSConn   *tls.Conn
 	hijTLSReader *bufio.Reader
 
-	// CONNECT tunnel, tracked from the hijack until ServeHTTP returns.
-	tunnel *Tunnel
+	// CONNECT tunnel, tracked from right before the hijack until ServeHTTP
+	// returns.
+	tunnel *tunnel
 	// The current MITM response ends the session ("Connection: close").
 	closeAfterResponse bool
 }
@@ -60,7 +61,7 @@ type Context struct {
 // closedByProxy reports whether the proxy closed the CONNECT tunnel itself:
 // the resulting I/O errors are expected and must not be reported.
 func (ctx *Context) closedByProxy() bool {
-	return ctx.tunnel != nil && ctx.tunnel.ClosedByProxy()
+	return ctx.tunnel != nil && ctx.tunnel.closedByProxy()
 }
 
 // mitmResponseCloses reports whether the MITM response about to be sent must
@@ -208,7 +209,7 @@ func (ctx *Context) doConnect(w http.ResponseWriter, r *http.Request) (b bool) {
 	// on ActiveTunnels counts it. A draining proxy therefore always sees it,
 	// even while OnConnect, the dial or the TLS handshake block. ServeHTTP
 	// untracks it.
-	ctx.tunnel = ctx.Prx.trackTunnel(r.URL.Host)
+	ctx.tunnel = ctx.Prx.trackTunnel(r.Context(), r.URL.Host)
 	conn, _, err := hij.Hijack()
 	if err != nil {
 		if r.Body != nil {
@@ -246,11 +247,14 @@ func (ctx *Context) doConnect(w http.ResponseWriter, r *http.Request) (b bool) {
 	}
 	switch ctx.ConnectAction {
 	case ConnectProxy:
-		dialer := net.Dialer{Timeout: ctx.Prx.dialTimeout()}
 		start := time.Now()
-		conn, err := dialer.DialContext(r.Context(), "tcp", host)
+		conn, err := ctx.Prx.dialRemote(ctx.tunnel.ctx, host)
 		ctx.ConnectDialDuration = time.Since(start)
 		if err != nil {
+			if ctx.closedByProxy() {
+				// The proxy closed the tunnel, which aborted the dial.
+				return
+			}
 			ctx.ConnectDialError = ClassifyDialError(err)
 			ctx.ConnectDialAddr = ExtractDialAddr(err)
 			hijConn.Write([]byte("HTTP/1.1 503 Service Unavailable\r\n\r\n"))
@@ -272,7 +276,7 @@ func (ctx *Context) doConnect(w http.ResponseWriter, r *http.Request) (b bool) {
 			}
 			return
 		}
-		tunnel := ctx.tunnel
+		tun := ctx.tunnel
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() {
@@ -285,7 +289,7 @@ func (ctx *Context) doConnect(w http.ResponseWriter, r *http.Request) (b bool) {
 				}
 				hijConn.Close()
 				remoteConn.Close()
-				if !isConnectionClosed(err) && !tunnel.ClosedByProxy() {
+				if !isConnectionClosed(err) && !tun.closedByProxy() {
 					ctx.doError("Connect", ErrRequestRead, err)
 				}
 			}()
@@ -308,7 +312,7 @@ func (ctx *Context) doConnect(w http.ResponseWriter, r *http.Request) (b bool) {
 				}
 				hijConn.Close()
 				remoteConn.Close()
-				if !isConnectionClosed(err) && !tunnel.ClosedByProxy() {
+				if !isConnectionClosed(err) && !tun.closedByProxy() {
 					ctx.doError("Connect", ErrResponseWrite, err)
 				}
 			}()
@@ -364,6 +368,8 @@ func (ctx *Context) doMitm() (w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	// Closing the tunnel aborts the upstream call through this context.
+	req = req.WithContext(ctx.tunnel.ctx)
 	req.RemoteAddr = ctx.ConnectReq.RemoteAddr
 	if req.URL.IsAbs() {
 		ctx.doError("Request", ErrAbsURLAfterCONNECT, nil)
