@@ -7,11 +7,13 @@ import (
 	"time"
 )
 
-// Tunnel is a client connection hijacked by the proxy after a CONNECT
-// request: a pass-through TCP tunnel (ConnectProxy) or a MITM session
-// (ConnectMitm). It is tracked from the moment the connection is hijacked,
-// including while the proxy dials the remote host or negotiates TLS, so that
-// a draining proxy knows what is still in progress.
+// Tunnel is a CONNECT request whose client connection the proxy hijacks: a
+// pass-through TCP tunnel (ConnectProxy) or a MITM session (ConnectMitm). It
+// is tracked from right before the hijack, so that a draining proxy sees it at
+// every step: while OnConnect runs, while the proxy dials the remote host or
+// negotiates TLS, and while data flows. Until the hijack, http.Server counts
+// the connection as active: there is no moment when neither of them tracks
+// it.
 //
 // The proxy never closes a pass-through tunnel early on its own: the tunnel
 // is encrypted end to end, so nothing tells the proxy whether a response is
@@ -19,16 +21,13 @@ import (
 // waits for the tunnels to end, and cuts the remaining ones with
 // CloseAllTunnels at its deadline.
 type Tunnel struct {
-	// Host is the CONNECT target (host:port).
-	Host string
-	// Action is how the tunnel is handled.
-	Action ConnectAction
-	// Start is when the connection was hijacked.
-	Start time.Time
+	start time.Time // when the tunnel was tracked, right before the hijack
 
 	mu     sync.Mutex
-	client net.Conn
-	remote net.Conn // pass-through tunnels, once dialed
+	host   string        // CONNECT target (host:port), as rewritten by OnConnect
+	action ConnectAction // ConnectNone until OnConnect decides
+	client net.Conn      // nil until the connection is hijacked
+	remote net.Conn      // pass-through tunnels, once dialed
 	closed bool
 
 	closedByProxy atomic.Bool
@@ -45,6 +44,31 @@ type TunnelInfo struct {
 // case the resulting I/O errors are expected and must not be reported.
 func (t *Tunnel) ClosedByProxy() bool {
 	return t.closedByProxy.Load()
+}
+
+// setClient attaches the hijacked client connection. It returns false when
+// the proxy closed the tunnel before the hijack: the caller then still owns
+// client and must close it.
+func (t *Tunnel) setClient(client net.Conn) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return false
+	}
+	t.client = client
+	return true
+}
+
+// setTarget records the host and action decided by OnConnect. It returns
+// false when the proxy closed the tunnel while OnConnect ran.
+func (t *Tunnel) setTarget(host string, action ConnectAction) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return false
+	}
+	t.host, t.action = host, action
+	return true
 }
 
 // setRemote attaches the remote connection of a pass-through tunnel. It
@@ -72,11 +96,19 @@ func (t *Tunnel) close() bool {
 	t.closedByProxy.Store(true)
 	client, remote := t.client, t.remote
 	t.mu.Unlock()
-	client.Close()
+	if client != nil {
+		client.Close()
+	}
 	if remote != nil {
 		remote.Close()
 	}
 	return true
+}
+
+func (t *Tunnel) info(now time.Time) TunnelInfo {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return TunnelInfo{Host: t.host, Action: t.action, Age: now.Sub(t.start)}
 }
 
 type tunnelRegistry struct {
@@ -115,8 +147,10 @@ func (r *tunnelRegistry) list() []*Tunnel {
 	return ts
 }
 
-func (prx *Proxy) trackTunnel(host string, action ConnectAction, client net.Conn) *Tunnel {
-	t := &Tunnel{Host: host, Action: action, Start: time.Now(), client: client}
+// trackTunnel tracks a CONNECT request to host before its connection is
+// hijacked. Attach the connection with setClient.
+func (prx *Proxy) trackTunnel(host string) *Tunnel {
+	t := &Tunnel{start: time.Now(), host: host}
 	prx.tunnels.add(t)
 	return t
 }
@@ -126,7 +160,7 @@ func (prx *Proxy) untrackTunnel(t *Tunnel) {
 }
 
 // ActiveTunnels returns the number of open tunnels, including the ones still
-// being set up (dial, TLS handshake).
+// being set up (OnConnect, dial, TLS handshake).
 func (prx *Proxy) ActiveTunnels() int {
 	return prx.tunnels.count()
 }
@@ -154,7 +188,7 @@ func (prx *Proxy) CloseAllTunnels() []TunnelInfo {
 	now := time.Now()
 	for _, t := range prx.tunnels.list() {
 		if t.close() {
-			closed = append(closed, TunnelInfo{Host: t.Host, Action: t.Action, Age: now.Sub(t.Start)})
+			closed = append(closed, t.info(now))
 		}
 	}
 	return closed

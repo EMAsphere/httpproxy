@@ -203,6 +203,12 @@ func (ctx *Context) doConnect(w http.ResponseWriter, r *http.Request) (b bool) {
 		ctx.doError("Connect", ErrNotSupportHijacking, nil)
 		return
 	}
+	// Track the tunnel before hijacking its connection: until Hijack
+	// returns, http.Server.Shutdown waits for the connection, and from here
+	// on ActiveTunnels counts it. A draining proxy therefore always sees it,
+	// even while OnConnect, the dial or the TLS handshake block. ServeHTTP
+	// untracks it.
+	ctx.tunnel = ctx.Prx.trackTunnel(r.URL.Host)
 	conn, _, err := hij.Hijack()
 	if err != nil {
 		if r.Body != nil {
@@ -212,6 +218,11 @@ func (ctx *Context) doConnect(w http.ResponseWriter, r *http.Request) (b bool) {
 		return
 	}
 	hijConn := conn
+	if !ctx.tunnel.setClient(hijConn) {
+		// The proxy closed the tunnel before the hijack.
+		hijConn.Close()
+		return
+	}
 	ctx.ConnectReq = r
 	ctx.ConnectAction = ConnectProxy
 	host := r.URL.Host
@@ -229,9 +240,10 @@ func (ctx *Context) doConnect(w http.ResponseWriter, r *http.Request) (b bool) {
 		host += ":80"
 	}
 	ctx.ConnectHost = host
-	// Track the connection before any blocking operation (dial, TLS
-	// handshake), so that a draining proxy sees it. ServeHTTP untracks it.
-	ctx.tunnel = ctx.Prx.trackTunnel(host, ctx.ConnectAction, hijConn)
+	if !ctx.tunnel.setTarget(host, ctx.ConnectAction) {
+		// The proxy closed the tunnel while OnConnect ran.
+		return
+	}
 	switch ctx.ConnectAction {
 	case ConnectProxy:
 		dialer := net.Dialer{Timeout: ctx.Prx.dialTimeout()}

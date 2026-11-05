@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -79,13 +80,18 @@ func testCA(t *testing.T) (certPEM, keyPEM []byte) {
 // startProxy starts a proxy that handles every CONNECT with action.
 func startProxy(t *testing.T, action ConnectAction) (*Proxy, string, *errRecorder) {
 	t.Helper()
+	return startProxyOnConnect(t, func(ctx *Context, host string) (ConnectAction, string) {
+		return action, host
+	})
+}
+
+func startProxyOnConnect(t *testing.T, onConnect func(ctx *Context, host string) (ConnectAction, string)) (*Proxy, string, *errRecorder) {
+	t.Helper()
 	prx, err := NewProxyCert(testCA(t))
 	if err != nil {
 		t.Fatal(err)
 	}
-	prx.OnConnect = func(ctx *Context, host string) (ConnectAction, string) {
-		return action, host
-	}
+	prx.OnConnect = onConnect
 	// MITM tests talk to httptest TLS servers.
 	prx.Rt = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	rec := &errRecorder{}
@@ -308,6 +314,78 @@ func TestCloseAllTunnels(t *testing.T) {
 	}
 	// Tunnels closed on purpose must not be reported as errors.
 	rec.expectNone(t)
+}
+
+// OnConnect runs once the connection is hijacked, when http.Server no longer
+// waits for it. While the callback blocks, on an external service say, the
+// proxy must still see the tunnel and be able to close it, and must not dial
+// the remote host afterwards.
+func TestTunnelTrackedWhileOnConnectBlocks(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	prx, addr, rec := startProxyOnConnect(t, func(ctx *Context, host string) (ConnectAction, string) {
+		close(entered)
+		<-release
+		return ConnectProxy, host
+	})
+	var unblock sync.Once
+	t.Cleanup(func() { unblock.Do(func() { close(release) }) })
+	var dialed atomic.Int32
+	up := startUpstream(t, func(net.Conn) { dialed.Add(1) })
+
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	fmt.Fprintf(c, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", up, up)
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnConnect was not called")
+	}
+
+	if n := prx.ActiveTunnels(); n != 1 {
+		t.Fatalf("%d tracked tunnels while OnConnect runs, want 1", n)
+	}
+	closed := prx.CloseAllTunnels()
+	if len(closed) != 1 || closed[0].Host != up || closed[0].Action != ConnectNone {
+		t.Fatalf("closed %+v, want the tunnel to %s with no action decided yet", closed, up)
+	}
+	expectEOF(t, c)
+
+	unblock.Do(func() { close(release) })
+	waitFor(t, "the tunnel to be untracked", func() bool { return prx.ActiveTunnels() == 0 })
+	time.Sleep(100 * time.Millisecond) // a dial, if any, reaches the upstream
+	if dialed.Load() != 0 {
+		t.Fatal("the proxy dialed the remote host of a closed tunnel")
+	}
+	rec.expectNone(t)
+}
+
+// The proxy tracks a CONNECT right before hijacking its connection. A tunnel
+// closed in between has no connection to close yet: the hijacked connection
+// must then be refused, so that the caller closes it.
+func TestTunnelClosedBeforeHijack(t *testing.T) {
+	prx := &Proxy{}
+	tun := prx.trackTunnel("example.com:443")
+	closed := prx.CloseAllTunnels()
+	if len(closed) != 1 || closed[0].Host != "example.com:443" || closed[0].Action != ConnectNone {
+		t.Fatalf("closed %+v, want the pending tunnel", closed)
+	}
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	if tun.setClient(server) {
+		t.Fatal("a tunnel closed before the hijack accepted its connection")
+	}
+	if tun.setTarget("example.com:443", ConnectProxy) {
+		t.Fatal("a closed tunnel accepted its target")
+	}
+	prx.untrackTunnel(tun)
+	if n := prx.ActiveTunnels(); n != 0 {
+		t.Fatalf("%d tracked tunnels, want 0", n)
+	}
 }
 
 func TestMitmDrainingEndsSessionAfterResponse(t *testing.T) {
