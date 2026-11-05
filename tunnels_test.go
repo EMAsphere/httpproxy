@@ -16,7 +16,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -190,31 +189,25 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	}
 }
 
-// mitmClient returns an HTTP client that goes through the MITM proxy.
-func mitmClient(t *testing.T, proxyAddr string) *http.Client {
+// mitmSession opens a MITM session through the proxy: one TLS connection,
+// so that the tests control exactly which session carries each request (an
+// http.Client may open another connection or replay a request on its own).
+func mitmSession(t *testing.T, proxyAddr, target string) (*tls.Conn, *bufio.Reader) {
 	t.Helper()
-	proxyURL, err := url.Parse("http://" + proxyAddr)
-	if err != nil {
+	tc := tls.Client(dialTunnel(t, proxyAddr, target), &tls.Config{InsecureSkipVerify: true})
+	tc.SetDeadline(time.Now().Add(15 * time.Second))
+	if err := tc.Handshake(); err != nil {
 		t.Fatal(err)
 	}
-	tr := &http.Transport{
-		Proxy:           http.ProxyURL(proxyURL),
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
-	t.Cleanup(tr.CloseIdleConnections)
-	return &http.Client{Transport: tr, Timeout: 10 * time.Second}
+	return tc, bufio.NewReader(tc)
 }
 
-// keepAliveGet sends a keep-alive GET that must answer "ok", and returns the
-// response with its body read.
-func keepAliveGet(t *testing.T, client *http.Client, u string) *http.Response {
+// mitmGet sends a keep-alive GET on the session and returns the response,
+// which must be "ok", with its body read.
+func mitmGet(t *testing.T, tc *tls.Conn, br *bufio.Reader, target string) *http.Response {
 	t.Helper()
-	req, err := http.NewRequest("GET", u, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Connection", "keep-alive")
-	resp, err := client.Do(req)
+	sendMitmGet(t, tc, target)
+	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,6 +217,21 @@ func keepAliveGet(t *testing.T, client *http.Client, u string) *http.Response {
 		t.Fatalf("got %q, %v", body, err)
 	}
 	return resp
+}
+
+func sendMitmGet(t *testing.T, tc *tls.Conn, target string) {
+	t.Helper()
+	if _, err := fmt.Fprintf(tc, "GET / HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive\r\n\r\n", target); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// expectSessionEnd checks that the proxy ended the MITM session.
+func expectSessionEnd(t *testing.T, br *bufio.Reader) {
+	t.Helper()
+	if n, err := br.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+		t.Fatalf("want the session to end, got %d bytes, %v", n, err)
+	}
 }
 
 // startOKServer starts a TLS server that answers "ok" after delay.
@@ -304,19 +312,18 @@ func TestCloseAllTunnels(t *testing.T) {
 
 func TestMitmDrainingEndsSessionAfterResponse(t *testing.T) {
 	prx, addr, rec := startProxy(t, ConnectMitm)
-	upstream := startOKServer(t, 0)
-	client := mitmClient(t, addr)
+	target := startOKServer(t, 0).Listener.Addr().String()
+	tc, br := mitmSession(t, addr, target)
 
-	if resp := keepAliveGet(t, client, upstream.URL); resp.Close {
+	if resp := mitmGet(t, tc, br, target); resp.Close {
 		t.Fatal("the MITM session should be kept alive before draining")
 	}
-	waitFor(t, "the MITM session to be tracked", func() bool { return prx.ActiveTunnels() == 1 })
-
 	prx.SetDraining(true)
-	if resp := keepAliveGet(t, client, upstream.URL); !resp.Close {
+	if resp := mitmGet(t, tc, br, target); !resp.Close {
 		t.Fatal(`while draining, the response should carry "Connection: close"`)
 	}
-	waitFor(t, "the MITM session to end", func() bool { return prx.ActiveTunnels() == 0 })
+	expectSessionEnd(t, br)
+	waitFor(t, "the MITM session to be untracked", func() bool { return prx.ActiveTunnels() == 0 })
 	rec.expectNone(t)
 }
 
@@ -324,18 +331,24 @@ func TestMitmDrainingEndsSessionAfterResponse(t *testing.T) {
 // the MITM session after that response.
 func TestMitmDrainingStartedDuringUpstreamCall(t *testing.T) {
 	prx, addr, rec := startProxy(t, ConnectMitm)
-	upstream := startOKServer(t, 500*time.Millisecond)
-	client := mitmClient(t, addr)
-	keepAliveGet(t, client, upstream.URL)
+	target := startOKServer(t, 500*time.Millisecond).Listener.Addr().String()
+	tc, br := mitmSession(t, addr, target)
+	mitmGet(t, tc, br, target)
 
-	go func() {
-		time.Sleep(150 * time.Millisecond)
-		prx.SetDraining(true)
-	}()
-	if resp := keepAliveGet(t, client, upstream.URL); !resp.Close {
+	sendMitmGet(t, tc, target)
+	time.Sleep(150 * time.Millisecond) // the request now waits for the upstream
+	prx.SetDraining(true)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !resp.Close {
 		t.Fatal(`draining started during the upstream call: the response should carry "Connection: close"`)
 	}
-	waitFor(t, "the MITM session to end", func() bool { return prx.ActiveTunnels() == 0 })
+	expectSessionEnd(t, br)
+	waitFor(t, "the MITM session to be untracked", func() bool { return prx.ActiveTunnels() == 0 })
 	rec.expectNone(t)
 }
 
@@ -343,8 +356,7 @@ func TestMitmDrainingStartedDuringUpstreamCall(t *testing.T) {
 // handshake yet is connected: the proxy must see it and be able to close it.
 func TestMitmHandshakeInProgressIsTracked(t *testing.T) {
 	prx, addr, rec := startProxy(t, ConnectMitm)
-	upstream := startOKServer(t, 0)
-	c := dialTunnel(t, addr, upstream.Listener.Addr().String())
+	c := dialTunnel(t, addr, startOKServer(t, 0).Listener.Addr().String())
 
 	waitFor(t, "the pending handshake to be tracked", func() bool { return prx.ActiveTunnels() == 1 })
 	if closed := prx.CloseAllTunnels(); len(closed) != 1 {
@@ -359,25 +371,19 @@ func TestMitmHandshakeInProgressIsTracked(t *testing.T) {
 // be reported as an error.
 func TestCloseAllTunnelsDuringMitmRequestIsNotAnError(t *testing.T) {
 	prx, addr, rec := startProxy(t, ConnectMitm)
-	upstream := startOKServer(t, 500*time.Millisecond)
-	client := mitmClient(t, addr)
-	keepAliveGet(t, client, upstream.URL)
+	target := startOKServer(t, 500*time.Millisecond).Listener.Addr().String()
+	tc, br := mitmSession(t, addr, target)
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		req, _ := http.NewRequest("GET", upstream.URL, nil)
-		req.Header.Set("Connection", "keep-alive")
-		if resp, err := client.Do(req); err == nil {
-			resp.Body.Close()
-		}
-	}()
-	time.Sleep(150 * time.Millisecond)
+	sendMitmGet(t, tc, target)
+	time.Sleep(150 * time.Millisecond) // the request now waits for the upstream
 	if closed := prx.CloseAllTunnels(); len(closed) != 1 {
 		t.Fatalf("closed %d tunnels, want 1", len(closed))
 	}
-	<-done
-	waitFor(t, "the MITM session to end", func() bool { return prx.ActiveTunnels() == 0 })
-	time.Sleep(700 * time.Millisecond) // let the upstream answer and the proxy try to write it
+	if _, err := http.ReadResponse(br, nil); err == nil {
+		t.Fatal("got a response from a session closed by the proxy")
+	}
+	// The proxy untracks the session once it has tried to write the
+	// upstream response to the closed connection.
+	waitFor(t, "the MITM session to be untracked", func() bool { return prx.ActiveTunnels() == 0 })
 	rec.expectNone(t)
 }
