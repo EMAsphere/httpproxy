@@ -1,7 +1,9 @@
 package httpproxy
 
 import (
+	"context"
 	"crypto/tls"
+	"net"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -9,7 +11,8 @@ import (
 
 // Proxy defines parameters for running an HTTP Proxy. It implements
 // http.Handler interface for ListenAndServe function. If you need, you must
-// set Proxy struct before handling requests.
+// set Proxy struct before handling requests. A Proxy must not be copied after
+// first use: a copy would not share the open tunnels.
 type Proxy struct {
 	// Session number of last proxy request.
 	SessionNo int64
@@ -62,6 +65,15 @@ type Proxy struct {
 	DialTimeout time.Duration
 
 	signer *CaSigner
+
+	// dial opens the remote connection of a pass-through tunnel, a
+	// *net.TCPConn. Nil means a net.Dialer with DialTimeout. Tests replace
+	// it.
+	dial func(ctx context.Context, network, address string) (net.Conn, error)
+
+	// Open tunnels and draining mode, see tunnels.go.
+	tunnels  tunnelRegistry
+	draining atomic.Bool
 }
 
 // NewProxy returns a new Proxy has default CA certificate and key.
@@ -91,6 +103,15 @@ func NewProxyCert(caCert, caKey []byte) (*Proxy, error) {
 		return nil, err
 	}
 	return prx, nil
+}
+
+// dialRemote opens the remote connection of a pass-through tunnel.
+func (prx *Proxy) dialRemote(ctx context.Context, host string) (net.Conn, error) {
+	if prx.dial != nil {
+		return prx.dial(ctx, "tcp", host)
+	}
+	dialer := net.Dialer{Timeout: prx.dialTimeout()}
+	return dialer.DialContext(ctx, "tcp", host)
 }
 
 func (prx *Proxy) dialTimeout() time.Duration {
@@ -125,6 +146,13 @@ func (prx *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.Header.Del("Proxy-Authenticate")
 	r.Header.Del("Proxy-Authorization")
 
+	// doConnect tracks the CONNECT tunnel, if any: untrack it whatever
+	// happens to it.
+	defer func() {
+		if ctx.tunnel != nil {
+			prx.untrackTunnel(ctx.tunnel)
+		}
+	}()
 	if b := ctx.doConnect(w, r); b {
 		return
 	}
@@ -146,18 +174,21 @@ func (prx *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		//r.Header.Del("Accept-Encoding")
 		//r.Header.Del("Connection")
 		ctx.SubSessionNo++
+		// Set by doRequest or doResponse when the response ends the MITM
+		// session (draining).
+		ctx.closeAfterResponse = false
 		if b, err := ctx.doRequest(w2, r2); err != nil {
 			break
 		} else {
 			if b {
-				if !cyclic {
+				if !cyclic || ctx.closeAfterResponse {
 					break
 				} else {
 					continue
 				}
 			}
 		}
-		if err := ctx.doResponse(w2, r2); err != nil || !cyclic {
+		if err := ctx.doResponse(w2, r2); err != nil || !cyclic || ctx.closeAfterResponse {
 			break
 		}
 	}

@@ -42,6 +42,12 @@ func InMemoryResponse(code int, header http.Header, body []byte) *http.Response 
 
 // ServeResponse serves HTTP response to http.ResponseWriter.
 func ServeResponse(w http.ResponseWriter, resp *http.Response) error {
+	return serveResponse(w, resp, false)
+}
+
+// serveResponse serves HTTP response to http.ResponseWriter, with
+// "Connection: close" when forceClose is set.
+func serveResponse(w http.ResponseWriter, resp *http.Response, forceClose bool) error {
 	if resp.Body != nil {
 		defer resp.Body.Close()
 	}
@@ -88,6 +94,9 @@ func ServeResponse(w http.ResponseWriter, resp *http.Response) error {
 		if te == "chunked" {
 			h.Set("Connection", "close")
 		}
+	}
+	if forceClose {
+		h.Set("Connection", "close")
 	}
 	switch te {
 	case "":
