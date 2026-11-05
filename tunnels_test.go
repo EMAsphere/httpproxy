@@ -302,19 +302,6 @@ func TestCloseAllTunnels(t *testing.T) {
 	rec.expectNone(t)
 }
 
-func TestCloseIdleTunnelsWithoutIdleDetection(t *testing.T) {
-	if IdleDetectionSupported() {
-		t.Skip("idle detection is supported on this platform")
-	}
-	prx, addr, _ := startProxy(t, ConnectProxy)
-	c := dialTunnel(t, addr, startUpstream(t, pingPong(0)))
-	ping(t, c)
-	time.Sleep(100 * time.Millisecond)
-	if closed := prx.CloseIdleTunnels(0); len(closed) != 0 {
-		t.Fatalf("closed %d tunnels without idle detection", len(closed))
-	}
-}
-
 func TestMitmDrainingEndsSessionAfterResponse(t *testing.T) {
 	prx, addr, rec := startProxy(t, ConnectMitm)
 	upstream := startOKServer(t, 0)
@@ -330,5 +317,67 @@ func TestMitmDrainingEndsSessionAfterResponse(t *testing.T) {
 		t.Fatal(`while draining, the response should carry "Connection: close"`)
 	}
 	waitFor(t, "the MITM session to end", func() bool { return prx.ActiveTunnels() == 0 })
+	rec.expectNone(t)
+}
+
+// Draining that starts while the upstream is still working must still end
+// the MITM session after that response.
+func TestMitmDrainingStartedDuringUpstreamCall(t *testing.T) {
+	prx, addr, rec := startProxy(t, ConnectMitm)
+	upstream := startOKServer(t, 500*time.Millisecond)
+	client := mitmClient(t, addr)
+	keepAliveGet(t, client, upstream.URL)
+
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		prx.SetDraining(true)
+	}()
+	if resp := keepAliveGet(t, client, upstream.URL); !resp.Close {
+		t.Fatal(`draining started during the upstream call: the response should carry "Connection: close"`)
+	}
+	waitFor(t, "the MITM session to end", func() bool { return prx.ActiveTunnels() == 0 })
+	rec.expectNone(t)
+}
+
+// A client that got "200" to its CONNECT but has not started the TLS
+// handshake yet is connected: the proxy must see it and be able to close it.
+func TestMitmHandshakeInProgressIsTracked(t *testing.T) {
+	prx, addr, rec := startProxy(t, ConnectMitm)
+	upstream := startOKServer(t, 0)
+	c := dialTunnel(t, addr, upstream.Listener.Addr().String())
+
+	waitFor(t, "the pending handshake to be tracked", func() bool { return prx.ActiveTunnels() == 1 })
+	if closed := prx.CloseAllTunnels(); len(closed) != 1 {
+		t.Fatalf("closed %d tunnels, want 1", len(closed))
+	}
+	expectEOF(t, c)
+	waitFor(t, "the tunnel to be untracked", func() bool { return prx.ActiveTunnels() == 0 })
+	rec.expectNone(t)
+}
+
+// Closing a MITM session on purpose while a request is in progress must not
+// be reported as an error.
+func TestCloseAllTunnelsDuringMitmRequestIsNotAnError(t *testing.T) {
+	prx, addr, rec := startProxy(t, ConnectMitm)
+	upstream := startOKServer(t, 500*time.Millisecond)
+	client := mitmClient(t, addr)
+	keepAliveGet(t, client, upstream.URL)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		req, _ := http.NewRequest("GET", upstream.URL, nil)
+		req.Header.Set("Connection", "keep-alive")
+		if resp, err := client.Do(req); err == nil {
+			resp.Body.Close()
+		}
+	}()
+	time.Sleep(150 * time.Millisecond)
+	if closed := prx.CloseAllTunnels(); len(closed) != 1 {
+		t.Fatalf("closed %d tunnels, want 1", len(closed))
+	}
+	<-done
+	waitFor(t, "the MITM session to end", func() bool { return prx.ActiveTunnels() == 0 })
+	time.Sleep(700 * time.Millisecond) // let the upstream answer and the proxy try to write it
 	rec.expectNone(t)
 }

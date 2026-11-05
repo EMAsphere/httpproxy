@@ -129,14 +129,16 @@ func (prx *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.Header.Del("Proxy-Authenticate")
 	r.Header.Del("Proxy-Authorization")
 
-	if b := ctx.doConnect(w, r); b {
-		return
-	}
+	// doConnect tracks the CONNECT tunnel, if any: untrack it whatever
+	// happens to it.
 	defer func() {
 		if ctx.tunnel != nil {
 			prx.untrackTunnel(ctx.tunnel)
 		}
 	}()
+	if b := ctx.doConnect(w, r); b {
+		return
+	}
 
 	for {
 		var w2 = w
@@ -152,27 +154,24 @@ func (prx *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if w2 == nil || r2 == nil {
 			break
 		}
-		// While draining, end the MITM session after this request and tell
-		// the client so with "Connection: close".
-		ctx.closeAfterResponse = ctx.ConnectAction == ConnectMitm && prx.Draining()
-		if ctx.closeAfterResponse {
-			cyclic = false
-		}
 		//r.Header.Del("Accept-Encoding")
 		//r.Header.Del("Connection")
 		ctx.SubSessionNo++
+		// Set by doRequest or doResponse when the response ends the MITM
+		// session (draining).
+		ctx.closeAfterResponse = false
 		if b, err := ctx.doRequest(w2, r2); err != nil {
 			break
 		} else {
 			if b {
-				if !cyclic {
+				if !cyclic || ctx.closeAfterResponse {
 					break
 				} else {
 					continue
 				}
 			}
 		}
-		if err := ctx.doResponse(w2, r2); err != nil || !cyclic {
+		if err := ctx.doResponse(w2, r2); err != nil || !cyclic || ctx.closeAfterResponse {
 			break
 		}
 	}

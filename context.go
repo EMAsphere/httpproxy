@@ -51,15 +51,23 @@ type Context struct {
 	hijTLSConn   *tls.Conn
 	hijTLSReader *bufio.Reader
 
-	// MITM session, tracked while it is open.
+	// CONNECT tunnel, tracked from the hijack until ServeHTTP returns.
 	tunnel *Tunnel
-	// Answer the current MITM request with "Connection: close".
+	// The current MITM response ends the session ("Connection: close").
 	closeAfterResponse bool
 }
 
-// closedByProxy reports whether the proxy closed the MITM session itself.
+// closedByProxy reports whether the proxy closed the CONNECT tunnel itself:
+// the resulting I/O errors are expected and must not be reported.
 func (ctx *Context) closedByProxy() bool {
 	return ctx.tunnel != nil && ctx.tunnel.ClosedByProxy()
+}
+
+// mitmResponseCloses reports whether the MITM response about to be sent must
+// end the session. It is called right before the response headers go out, so
+// that draining that started during the upstream call is taken into account.
+func (ctx *Context) mitmResponseCloses() bool {
+	return ctx.ConnectAction == ConnectMitm && ctx.Prx.Draining()
 }
 
 func (ctx *Context) onAccept(w http.ResponseWriter, r *http.Request) bool {
@@ -221,6 +229,9 @@ func (ctx *Context) doConnect(w http.ResponseWriter, r *http.Request) (b bool) {
 		host += ":80"
 	}
 	ctx.ConnectHost = host
+	// Track the connection before any blocking operation (dial, TLS
+	// handshake), so that a draining proxy sees it. ServeHTTP untracks it.
+	ctx.tunnel = ctx.Prx.trackTunnel(host, ctx.ConnectAction, hijConn)
 	switch ctx.ConnectAction {
 	case ConnectProxy:
 		dialer := net.Dialer{Timeout: ctx.Prx.dialTimeout()}
@@ -236,16 +247,20 @@ func (ctx *Context) doConnect(w http.ResponseWriter, r *http.Request) (b bool) {
 			return
 		}
 		remoteConn := conn.(*net.TCPConn)
+		if !ctx.tunnel.setRemote(remoteConn) {
+			// The proxy closed the tunnel while dialing.
+			remoteConn.Close()
+			return
+		}
 		if _, err := hijConn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n")); err != nil {
 			hijConn.Close()
 			remoteConn.Close()
-			if !isConnectionClosed(err) {
+			if !isConnectionClosed(err) && !ctx.closedByProxy() {
 				ctx.doError("Connect", ErrResponseWrite, err)
 			}
 			return
 		}
-		tunnel := ctx.Prx.trackTunnel(host, ConnectProxy, hijConn, remoteConn)
-		defer ctx.Prx.untrackTunnel(tunnel)
+		tunnel := ctx.tunnel
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() {
@@ -308,7 +323,7 @@ func (ctx *Context) doConnect(w http.ResponseWriter, r *http.Request) (b bool) {
 		tlsConfig.Certificates = append(tlsConfig.Certificates, *cert)
 		if _, err := hijConn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n")); err != nil {
 			hijConn.Close()
-			if !isConnectionClosed(err) {
+			if !isConnectionClosed(err) && !ctx.closedByProxy() {
 				ctx.doError("Connect", ErrResponseWrite, err)
 			}
 			return
@@ -316,14 +331,12 @@ func (ctx *Context) doConnect(w http.ResponseWriter, r *http.Request) (b bool) {
 		ctx.hijTLSConn = tls.Server(hijConn, tlsConfig)
 		if err := ctx.hijTLSConn.Handshake(); err != nil {
 			ctx.hijTLSConn.Close()
-			if !isConnectionClosed(err) {
+			if !isConnectionClosed(err) && !ctx.closedByProxy() {
 				ctx.doError("Connect '"+host+"'", ErrTLSHandshake, err)
 			}
 			return
 		}
 		ctx.hijTLSReader = bufio.NewReader(ctx.hijTLSConn)
-		// Untracked by ServeHTTP when the session ends.
-		ctx.tunnel = ctx.Prx.trackTunnel(host, ConnectMitm, hijConn, nil)
 		b = false
 	default:
 		hijConn.Close()
@@ -378,8 +391,9 @@ func (ctx *Context) doRequest(w http.ResponseWriter, r *http.Request) (bool, err
 	if ctx.ConnectAction == ConnectMitm && ctx.Prx.MitmChunked {
 		resp.TransferEncoding = []string{"chunked"}
 	}
+	ctx.closeAfterResponse = ctx.mitmResponseCloses()
 	err := serveResponse(w, resp, ctx.closeAfterResponse)
-	if err != nil && !isConnectionClosed(err) {
+	if err != nil && !isConnectionClosed(err) && !ctx.closedByProxy() {
 		ctx.doError("Request", ErrResponseWrite, err)
 	}
 	return true, err
@@ -391,11 +405,12 @@ func (ctx *Context) doResponse(w http.ResponseWriter, r *http.Request) error {
 	}
 	resp, err := ctx.Prx.Rt.RoundTrip(r)
 	if err != nil {
-		if err != context.Canceled && !isConnectionClosed(err) {
+		if err != context.Canceled && !isConnectionClosed(err) && !ctx.closedByProxy() {
 			ctx.doError("Response", ErrRoundTrip, err)
 		}
-		err := ServeInMemory(w, 404, nil, nil)
-		if err != nil && !isConnectionClosed(err) {
+		ctx.closeAfterResponse = ctx.mitmResponseCloses()
+		err := serveResponse(w, InMemoryResponse(404, nil, nil), ctx.closeAfterResponse)
+		if err != nil && !isConnectionClosed(err) && !ctx.closedByProxy() {
 			ctx.doError("Response", ErrResponseWrite, err)
 		}
 		return err
@@ -408,8 +423,9 @@ func (ctx *Context) doResponse(w http.ResponseWriter, r *http.Request) error {
 	if ctx.ConnectAction == ConnectMitm && ctx.Prx.MitmChunked {
 		resp.TransferEncoding = []string{"chunked"}
 	}
+	ctx.closeAfterResponse = ctx.mitmResponseCloses()
 	err = serveResponse(w, resp, ctx.closeAfterResponse)
-	if err != nil && !isConnectionClosed(err) {
+	if err != nil && !isConnectionClosed(err) && !ctx.closedByProxy() {
 		ctx.doError("Response", ErrResponseWrite, err)
 	}
 	return err
