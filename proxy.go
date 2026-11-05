@@ -62,6 +62,10 @@ type Proxy struct {
 	DialTimeout time.Duration
 
 	signer *CaSigner
+
+	// Open tunnels and draining mode, see tunnels.go.
+	tunnels  tunnelRegistry
+	draining atomic.Bool
 }
 
 // NewProxy returns a new Proxy has default CA certificate and key.
@@ -128,6 +132,11 @@ func (prx *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if b := ctx.doConnect(w, r); b {
 		return
 	}
+	defer func() {
+		if ctx.tunnel != nil {
+			prx.untrackTunnel(ctx.tunnel)
+		}
+	}()
 
 	for {
 		var w2 = w
@@ -142,6 +151,12 @@ func (prx *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if w2 == nil || r2 == nil {
 			break
+		}
+		// While draining, end the MITM session after this request and tell
+		// the client so with "Connection: close".
+		ctx.closeAfterResponse = ctx.ConnectAction == ConnectMitm && prx.Draining()
+		if ctx.closeAfterResponse {
+			cyclic = false
 		}
 		//r.Header.Del("Accept-Encoding")
 		//r.Header.Del("Connection")

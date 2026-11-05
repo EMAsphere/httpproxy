@@ -50,6 +50,16 @@ type Context struct {
 
 	hijTLSConn   *tls.Conn
 	hijTLSReader *bufio.Reader
+
+	// MITM session, tracked while it is open.
+	tunnel *Tunnel
+	// Answer the current MITM request with "Connection: close".
+	closeAfterResponse bool
+}
+
+// closedByProxy reports whether the proxy closed the MITM session itself.
+func (ctx *Context) closedByProxy() bool {
+	return ctx.tunnel != nil && ctx.tunnel.ClosedByProxy()
 }
 
 func (ctx *Context) onAccept(w http.ResponseWriter, r *http.Request) bool {
@@ -234,6 +244,8 @@ func (ctx *Context) doConnect(w http.ResponseWriter, r *http.Request) (b bool) {
 			}
 			return
 		}
+		tunnel := ctx.Prx.trackTunnel(host, ConnectProxy, hijConn, remoteConn)
+		defer ctx.Prx.untrackTunnel(tunnel)
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() {
@@ -246,7 +258,7 @@ func (ctx *Context) doConnect(w http.ResponseWriter, r *http.Request) (b bool) {
 				}
 				hijConn.Close()
 				remoteConn.Close()
-				if !isConnectionClosed(err) {
+				if !isConnectionClosed(err) && !tunnel.ClosedByProxy() {
 					ctx.doError("Connect", ErrRequestRead, err)
 				}
 			}()
@@ -269,7 +281,7 @@ func (ctx *Context) doConnect(w http.ResponseWriter, r *http.Request) (b bool) {
 				}
 				hijConn.Close()
 				remoteConn.Close()
-				if !isConnectionClosed(err) {
+				if !isConnectionClosed(err) && !tunnel.ClosedByProxy() {
 					ctx.doError("Connect", ErrResponseWrite, err)
 				}
 			}()
@@ -310,6 +322,8 @@ func (ctx *Context) doConnect(w http.ResponseWriter, r *http.Request) (b bool) {
 			return
 		}
 		ctx.hijTLSReader = bufio.NewReader(ctx.hijTLSConn)
+		// Untracked by ServeHTTP when the session ends.
+		ctx.tunnel = ctx.Prx.trackTunnel(host, ConnectMitm, hijConn, nil)
 		b = false
 	default:
 		hijConn.Close()
@@ -320,7 +334,7 @@ func (ctx *Context) doConnect(w http.ResponseWriter, r *http.Request) (b bool) {
 func (ctx *Context) doMitm() (w http.ResponseWriter, r *http.Request) {
 	req, err := http.ReadRequest(ctx.hijTLSReader)
 	if err != nil {
-		if !isConnectionClosed(err) {
+		if !isConnectionClosed(err) && !ctx.closedByProxy() {
 			ctx.doError("Request", ErrRequestRead, err)
 		}
 		return
@@ -364,7 +378,7 @@ func (ctx *Context) doRequest(w http.ResponseWriter, r *http.Request) (bool, err
 	if ctx.ConnectAction == ConnectMitm && ctx.Prx.MitmChunked {
 		resp.TransferEncoding = []string{"chunked"}
 	}
-	err := ServeResponse(w, resp)
+	err := serveResponse(w, resp, ctx.closeAfterResponse)
 	if err != nil && !isConnectionClosed(err) {
 		ctx.doError("Request", ErrResponseWrite, err)
 	}
@@ -394,7 +408,7 @@ func (ctx *Context) doResponse(w http.ResponseWriter, r *http.Request) error {
 	if ctx.ConnectAction == ConnectMitm && ctx.Prx.MitmChunked {
 		resp.TransferEncoding = []string{"chunked"}
 	}
-	err = ServeResponse(w, resp)
+	err = serveResponse(w, resp, ctx.closeAfterResponse)
 	if err != nil && !isConnectionClosed(err) {
 		ctx.doError("Response", ErrResponseWrite, err)
 	}
