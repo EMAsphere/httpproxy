@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -209,7 +210,7 @@ func (ctx *Context) doConnect(w http.ResponseWriter, r *http.Request) (b bool) {
 	// on ActiveTunnels counts it. A draining proxy therefore always sees it,
 	// even while OnConnect, the dial or the TLS handshake block. ServeHTTP
 	// untracks it.
-	ctx.tunnel = ctx.Prx.trackTunnel(r.Context(), r.URL.Host)
+	ctx.tunnel = ctx.Prx.trackTunnel(r.URL.Host)
 	conn, _, err := hij.Hijack()
 	if err != nil {
 		if r.Body != nil {
@@ -248,7 +249,9 @@ func (ctx *Context) doConnect(w http.ResponseWriter, r *http.Request) (b bool) {
 	switch ctx.ConnectAction {
 	case ConnectProxy:
 		start := time.Now()
-		conn, err := ctx.Prx.dialRemote(ctx.tunnel.ctx, host)
+		dialCtx, stopDial := ctx.tunnel.bind(r.Context())
+		conn, err := ctx.Prx.dialRemote(dialCtx, host)
+		stopDial()
 		ctx.ConnectDialDuration = time.Since(start)
 		if err != nil {
 			if ctx.closedByProxy() {
@@ -262,7 +265,14 @@ func (ctx *Context) doConnect(w http.ResponseWriter, r *http.Request) (b bool) {
 			ctx.doError("Connect", ErrRemoteConnect, err)
 			return
 		}
-		remoteConn := conn.(*net.TCPConn)
+		remoteConn, ok := conn.(*net.TCPConn)
+		if !ok {
+			conn.Close()
+			hijConn.Write([]byte("HTTP/1.1 503 Service Unavailable\r\n\r\n"))
+			hijConn.Close()
+			ctx.doError("Connect", ErrRemoteConnect, fmt.Errorf("dial returned a %T, not a TCP connection", conn))
+			return
+		}
 		if !ctx.tunnel.setRemote(remoteConn) {
 			// The proxy closed the tunnel while dialing.
 			remoteConn.Close()
@@ -423,7 +433,12 @@ func (ctx *Context) doResponse(w http.ResponseWriter, r *http.Request) error {
 	}
 	resp, err := ctx.Prx.Rt.RoundTrip(r)
 	if err != nil {
-		if err != context.Canceled && !isConnectionClosed(err) && !ctx.closedByProxy() {
+		if ctx.closedByProxy() {
+			// The proxy closed the tunnel, which aborted the call: there is
+			// no one to answer.
+			return err
+		}
+		if err != context.Canceled && !isConnectionClosed(err) {
 			ctx.doError("Response", ErrRoundTrip, err)
 		}
 		ctx.closeAfterResponse = ctx.mitmResponseCloses()

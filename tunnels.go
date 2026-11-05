@@ -23,9 +23,12 @@ import (
 // CloseAllTunnels at its deadline.
 type tunnel struct {
 	start time.Time // when the tunnel was tracked, right before the hijack
-	// ctx is cancelled when the tunnel is closed or untracked. The dial of a
-	// pass-through tunnel and the upstream calls of a MITM session use it,
-	// so that closing the tunnel aborts them.
+	// ctx is cancelled when the tunnel is closed or untracked, so that
+	// closing the tunnel aborts the dial of a pass-through tunnel and the
+	// upstream calls of a MITM session. It does not derive from the server's
+	// context: MITM upstream calls used context.Background before tunnels
+	// were tracked, and only end with their tunnel. The dial binds it to the
+	// CONNECT request's context, which it used before.
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -90,9 +93,10 @@ func (t *tunnel) setRemote(remote net.Conn) bool {
 	return true
 }
 
-// close closes both connections of the tunnel and aborts the dial or the
-// upstream call in progress. It returns false when the proxy had already
-// closed it.
+// close closes both connections of the tunnel, then aborts the dial or the
+// upstream call in progress. In this order, a handler woken by the abort
+// finds the client connection closed and cannot answer on it. It returns
+// false when the proxy had already closed the tunnel.
 func (t *tunnel) close() bool {
 	t.mu.Lock()
 	if t.closed.Load() {
@@ -102,14 +106,28 @@ func (t *tunnel) close() bool {
 	t.closed.Store(true)
 	client, remote := t.client, t.remote
 	t.mu.Unlock()
-	t.cancel()
 	if client != nil {
 		client.Close()
 	}
 	if remote != nil {
 		remote.Close()
 	}
+	t.cancel()
 	return true
+}
+
+// bind returns a context that ends with parent or when the tunnel is closed.
+// Call cancel once done with it.
+func (t *tunnel) bind(parent context.Context) (ctx context.Context, cancel context.CancelFunc) {
+	ctx, cancel = context.WithCancel(parent)
+	go func() {
+		select {
+		case <-t.ctx.Done():
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
 }
 
 func (t *tunnel) info(now time.Time) TunnelInfo {
@@ -138,10 +156,17 @@ func (r *tunnelRegistry) remove(t *tunnel) {
 	delete(r.tunnels, t)
 }
 
+// count returns the number of tunnels not closed by the proxy.
 func (r *tunnelRegistry) count() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return len(r.tunnels)
+	n := 0
+	for t := range r.tunnels {
+		if !t.closedByProxy() {
+			n++
+		}
+	}
+	return n
 }
 
 func (r *tunnelRegistry) list() []*tunnel {
@@ -155,10 +180,9 @@ func (r *tunnelRegistry) list() []*tunnel {
 }
 
 // trackTunnel tracks a CONNECT request to host before its connection is
-// hijacked. Attach the connection with setClient. The tunnel's context
-// derives from parent, the context of the CONNECT request.
-func (prx *Proxy) trackTunnel(parent context.Context, host string) *tunnel {
-	ctx, cancel := context.WithCancel(parent)
+// hijacked. Attach the connection with setClient.
+func (prx *Proxy) trackTunnel(host string) *tunnel {
+	ctx, cancel := context.WithCancel(context.Background())
 	t := &tunnel{start: time.Now(), ctx: ctx, cancel: cancel, host: host}
 	prx.tunnels.add(t)
 	return t
@@ -171,7 +195,9 @@ func (prx *Proxy) untrackTunnel(t *tunnel) {
 }
 
 // ActiveTunnels returns the number of open tunnels, including the ones still
-// being set up (OnConnect, dial, TLS handshake).
+// being set up (OnConnect, dial, TLS handshake). A tunnel closed by
+// CloseAllTunnels no longer counts, even while its handler is still blocked
+// in a callback.
 func (prx *Proxy) ActiveTunnels() int {
 	return prx.tunnels.count()
 }
